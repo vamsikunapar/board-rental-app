@@ -2,6 +2,9 @@ import SwiftUI
 import UserNotifications
 import CoreLocation
 import AuthenticationServices
+import UIKit
+import QuartzCore   // for CAEmitterLayer / CAEmitterCell
+
 
 extension Color {
     static let primaryGradient = LinearGradient(
@@ -37,6 +40,15 @@ enum Difficulty: String, CaseIterable, Codable, Identifiable {
     var id: String { rawValue }
 }
 
+enum PurchasePlan: String, CaseIterable, Identifiable, Codable {
+    case oneTime = "One-time"
+    case bundle = "Bundle (3 games)"
+    case subscription = "Monthly Unlimited"
+
+    var id: String { rawValue }
+}
+
+
 struct BoardGame: Identifiable, Codable, Hashable {
     let id: UUID
     var title: String
@@ -69,23 +81,27 @@ struct Rental: Identifiable, Codable, Hashable {
     var totalPaid: Double
     var status: RentalStatus
     var paymentStatus: PaymentStatus
+    var confirmationCode: String? = nil
 }
+
 
 struct RentalState: Codable {
     var active: [Rental] = []
     var past: [Rental] = []
 }
-
 struct UserProfile: Codable {
-    var name: String = ""
+    var firstName: String = ""
+    var lastName: String = ""
     var email: String = ""
     var phone: String = ""
-    var location: String = "" // e.g., "Orlando, FL, USA"
+    var location: String = ""
 }
 
 // MARK: - Onboarding
 
-enum AppStage: String, Codable { case auth, location, main }
+enum AppStage: String, Codable {
+    case auth, profile, location, celebration, main, unavailable
+}
 
 // MARK: - Persistence
 
@@ -206,7 +222,21 @@ final class AppStore: ObservableObject {
     @Published private(set) var pastRentals: [Rental] = []
     @Published var profile: UserProfile
     @Published var stage: AppStage
-    
+    @Published var celebrationMessage: String = ""
+
+    private let advantages: [String] = [
+        "Do you know board games sharpen strategic thinking and planning?",
+        "Do you know board games boost memory, attention, and focus skills?",
+        "Do you know playing together builds stronger communication?",
+        "Do you know board games reduce screen time in a fun way?",
+        "Do you know cooperative games encourage teamwork and trust?",
+        "Do you know board games teach patience, turn-taking, and fair play?",
+        "Do you know board games connect people across generations?",
+        "Do you know board games inspire creativity and storytelling?",
+        "Do you know many games improve math and logic practice?",
+        "Do you know playing board games create traditions and joyful shared moments?"
+    ]
+
     init() {
         let state = Persistence.shared.loadState()
         self.activeRentals = state.active
@@ -220,37 +250,84 @@ final class AppStore: ObservableObject {
         Persistence.shared.saveProfile(profile)
         Persistence.shared.saveStage(stage)
     }
-    
+    // In AppStore
     func signedIn(name: String?, email: String?) {
-        if let n = name { profile.name = n }
         if let e = email { profile.email = e }
+        // Do NOT prefill name from providers – ensure user enters real names
+        profile.firstName = ""
+        profile.lastName  = ""
+        stage = .profile
+        persist()
+    }
+
+
+    func completeProfile(first: String, last: String, phone: String) {
+        profile.firstName = first
+        profile.lastName = last
+        profile.phone = phone
         stage = .location
         persist()
     }
-    
+
+
     func setLocation(_ location: String) {
         profile.location = location
-        stage = .main
+        if location.localizedCaseInsensitiveContains("Orlando") {
+            celebrationMessage = advantages.randomElement()
+                ?? "Do you know board games bring people together?"
+            stage = .celebration    // go to confetti welcome before Catalog
+        } else {
+            stage = .unavailable
+        }
         persist()
     }
     
-    func createRental(for game: BoardGame, pickup: Date, days: Int) {
+    private func newConfirmationCode() -> String {
+        // Example: BB250825-7XK9QH (BB + yymmdd + 6-char base32-ish)
+        let df = DateFormatter()
+        df.dateFormat = "yyMMdd"
+        let datePart = df.string(from: Date())
+        let alphabet = Array("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") // no 0/1 to avoid confusion
+        let suffix = (0..<6).map { _ in alphabet.randomElement()! }
+        return "BB\(datePart)-" + String(suffix)
+    }
+
+
+    @discardableResult
+    func createRental(for game: BoardGame, pickup: Date, days: Int) -> Rental {
         let returnDate = Calendar.current.date(byAdding: .day, value: days, to: pickup) ?? pickup
         let daily = game.dailyPrice
         let deposit = game.deposit
         let total = daily * Double(days) + deposit
-        let rental = Rental(id: UUID(), game: game, pickup: pickup, returnDate: returnDate, days: days, dailyPrice: daily, deposit: deposit, totalPaid: total, status: .booked, paymentStatus: .paid)
+
+        let rental = Rental(
+            id: UUID(),
+            game: game,
+            pickup: pickup,
+            returnDate: returnDate,
+            days: days,
+            dailyPrice: daily,
+            deposit: deposit,
+            totalPaid: total,
+            status: .booked,
+            paymentStatus: .paid,
+            confirmationCode: newConfirmationCode()     // 👈 set it here
+        )
+
         activeRentals.append(rental)
         persist()
-        
+
+        // notifications (unchanged)
         let pickupReminder = Calendar.current.date(byAdding: .hour, value: -1, to: pickup) ?? pickup
         NotificationManager.shared.schedule(title: "Pickup reminder", body: "Pick up \(game.title) by your scheduled time.", date: pickupReminder, id: "pickup_\(rental.id)")
         var returnComponents = Calendar.current.dateComponents([.year, .month, .day], from: returnDate)
         returnComponents.hour = 18
         let returnAtSix = Calendar.current.date(from: returnComponents) ?? returnDate
         NotificationManager.shared.schedule(title: "Return due today", body: "Please return \(game.title) by end of day.", date: returnAtSix, id: "return_\(rental.id)")
+
+        return rental                                        // 👈 now returns it
     }
-    
+
     func markPickedUp(_ rental: Rental) {
         if let idx = activeRentals.firstIndex(of: rental) {
             activeRentals[idx].status = .pickedUp
@@ -266,6 +343,22 @@ final class AppStore: ObservableObject {
         pastRentals.insert(r, at: 0)
         persist()
     }
+    
+    @Published var hasSubscription: Bool = false
+
+    func activateSubscription(monthlyPrice: Double) {
+        hasSubscription = true
+        // Persist as needed
+        persist()
+    }
+
+    func createBundleRentals(for games: [BoardGame], pickup: Date, days: Int) {
+        for g in games {
+            createRental(for: g, pickup: pickup, days: days)
+        }
+    }
+
+    
 }
 
 // MARK: - Sample Data
@@ -296,7 +389,7 @@ enum SampleData {
             difficulty: .easy,
             dailyPrice: 6.99,
             deposit: 20,
-            imageName: "Tikcet to Ride",
+            imageName: "ticket to ride",
             description: "Collect cards, claim railway routes, and connect cities across the map.",
             rating: 4.7
         ),
@@ -415,7 +508,7 @@ struct AuthView: View {
                     SignInWithAppleButton(.continue) { request in
                         request.requestedScopes = [.fullName, .email]
                     } onCompletion: { _ in
-                        pendingName = "Apple User"
+                        pendingName = nil
                         withAnimation { step = .email }
                     }
                     .signInWithAppleButtonStyle(.white) // contrasts on purple bg
@@ -424,7 +517,7 @@ struct AuthView: View {
 
                     // Google (mock -> then email/password)
                     Button {
-                        pendingName = "Google User"
+                        pendingName = nil
                         withAnimation { step = .email }
                     } label: {
                         HStack(spacing: 8) {
@@ -489,6 +582,51 @@ struct AuthView: View {
         .preferredColorScheme(.dark) // optional: keeps text legible on bright gradients
     }
 }
+struct ProfileCaptureView: View {
+    @EnvironmentObject var store: AppStore
+    @State private var firstName = ""
+    @State private var lastName = ""
+    @State private var phone = ""
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Your Details") {
+                    TextField("First name", text: $firstName)
+                        .textContentType(.givenName)
+                    TextField("Last name", text: $lastName)
+                        .textContentType(.familyName)
+                    TextField("Phone number", text: $phone)
+                        .keyboardType(.phonePad)
+                        .textContentType(.telephoneNumber)
+                }
+
+                Section {
+                    Button("Continue") {
+                        guard !firstName.trimmingCharacters(in: .whitespaces).isEmpty,
+                              !lastName.trimmingCharacters(in: .whitespaces).isEmpty,
+                              !phone.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+                        store.completeProfile(first: firstName, last: lastName, phone: phone)
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .principal) {
+                    Text("Welcome \(store.profile.firstName) \(store.profile.lastName)")
+                        .font(.headline)              // base size
+                        .lineLimit(2)                 // allow up to 2 lines
+                        .minimumScaleFactor(0.6)      // shrink font if still too long
+                        .multilineTextAlignment(.center)
+                        .accessibilityLabel("Welcome \(store.profile.firstName) \(store.profile.lastName)")
+                }
+            }
+
+        }
+    }
+}
+
 
 
     struct LocationCaptureView: View {
@@ -544,6 +682,159 @@ struct AuthView: View {
                 if !new.isEmpty { store.setLocation(new) }
             }
         }
+}
+
+struct ConfettiView: UIViewRepresentable {
+    private let showForSeconds: TimeInterval = 4.0
+    private let gravity: CGFloat = 220
+
+    func makeUIView(context: Context) -> UIView {
+        let view = UIView()
+        view.backgroundColor = .clear
+
+        let W = UIScreen.main.bounds.width
+        let H = UIScreen.main.bounds.height
+        let midY = H / 2
+
+        // Bright palette & a few bold shapes
+        let colors: [UIColor] = [.systemPink, .systemBlue, .systemGreen, .systemOrange, .systemPurple, .systemTeal, .systemYellow, .systemRed]
+        let symbols = ["circle.fill", "square.fill", "triangle.fill", "star.fill", "heart.fill", "seal.fill"]
+
+        // Rasterize SF Symbol -> CGImage so emitter always has contents
+        func symbolCGImage(_ name: String, color: UIColor) -> CGImage? {
+            let cfg = UIImage.SymbolConfiguration(pointSize: 18, weight: .heavy)
+            guard let img = UIImage(systemName: name, withConfiguration: cfg)?
+                .withTintColor(color, renderingMode: .alwaysOriginal) else { return nil }
+            let renderer = UIGraphicsImageRenderer(size: img.size)
+            return renderer.image { _ in img.draw(at: .zero) }.cgImage
+        }
+
+        // Fewer particles: birthRate=2 (was ~5). Upward launch, then gravity.
+        func makeCell(color: UIColor, symbol: String, inwardXAccel: CGFloat) -> CAEmitterCell {
+            let c = CAEmitterCell()
+            c.birthRate = 2                 // ~50% fewer vs prior
+            c.lifetime = 5
+            c.velocity = 200                // initial speed up
+            c.velocityRange = 50
+            c.emissionLongitude = -.pi/2    // UP
+            c.emissionRange = .pi/9         // narrow spread
+            c.yAcceleration = gravity       // fall back down
+            c.xAcceleration = inwardXAccel  // drift toward center
+            c.spin = 3.2
+            c.spinRange = 1.2
+            c.scale = 0.5
+            c.scaleRange = 0.25
+            c.alphaSpeed = -0.15
+            c.contents = symbolCGImage(symbol, color: color)
+            return c
+        }
+
+        // LEFT edge (middle of screen), drift rightwards toward center
+        let left = CAEmitterLayer()
+        left.emitterPosition = CGPoint(x: 0, y: midY)
+        left.emitterShape = .point
+        left.beginTime = CACurrentMediaTime()
+        left.birthRate = 1
+        left.emitterCells = colors.shuffled().prefix(4).flatMap { color in
+            symbols.shuffled().prefix(2).map { sym in makeCell(color: color, symbol: sym, inwardXAccel: 60) }
+        }
+        view.layer.addSublayer(left)
+
+        // RIGHT edge (middle of screen), drift leftwards toward center
+        let right = CAEmitterLayer()
+        right.emitterPosition = CGPoint(x: W, y: midY)
+        right.emitterShape = .point
+        right.beginTime = CACurrentMediaTime()
+        right.birthRate = 1
+        right.emitterCells = colors.shuffled().prefix(4).flatMap { color in
+            symbols.shuffled().prefix(2).map { sym in makeCell(color: color, symbol: sym, inwardXAccel: -60) }
+        }
+        view.layer.addSublayer(right)
+
+        // Stop spawning new confetti after a bit (existing ones keep falling)
+        DispatchQueue.main.asyncAfter(deadline: .now() + showForSeconds) {
+            left.birthRate = 0
+            right.birthRate = 0
+        }
+
+        return view
+    }
+
+    func updateUIView(_ uiView: UIView, context: Context) {}
+}
+
+
+struct CelebrationView: View {
+    @EnvironmentObject var store: AppStore
+
+    var body: some View {
+        ZStack {
+            LinearGradient(colors: [.purple.opacity(0.2), .blue.opacity(0.2)],
+                           startPoint: .topLeading, endPoint: .bottomTrailing)
+                .ignoresSafeArea()
+
+            VStack(spacing: 20) {
+                Text("Welcome, \(store.profile.firstName) \(store.profile.lastName)!")
+                    .font(.largeTitle.bold())
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.6)
+
+                Text(store.celebrationMessage)
+                    .font(.headline)
+                    .multilineTextAlignment(.center)
+                    .padding(.horizontal)
+            }
+            .padding()
+        }
+        // Make the confetti fill the screen so it's always visible
+        .overlay(
+            ConfettiView()
+                .allowsHitTesting(false)
+                .ignoresSafeArea()
+        )
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                store.stage = .main
+            }
+        }
+    }
+}
+
+
+struct ServiceUnavailableView: View {
+    @EnvironmentObject var store: AppStore
+    let location: String
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+            Image(systemName: "exclamationmark.triangle.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(.yellow)
+            Text("Sorry")
+                .font(.largeTitle.bold())
+            Text("We currently do not have service in \"\(location)\".")
+                .multilineTextAlignment(.center)
+                .padding(.horizontal)
+
+            Button("Change Location") {
+                store.stage = .location
+            }
+            .buttonStyle(.bordered)
+
+            Button("Sign Out") {
+                store.stage = .auth
+                store.profile = UserProfile()
+                Persistence.shared.saveStage(.auth)
+                Persistence.shared.saveProfile(store.profile)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Spacer()
+        }
+        .padding()
+    }
 }
 
 // MARK: - Main App Views
@@ -605,12 +896,14 @@ struct CatalogView: View {
                         .padding(.horizontal)
                         .padding(.top)
                     }
-                    .sheet(isPresented: $showLocationChanger) {
+
+                    .sheet(isPresented: $showLocationChanger) {       // ✅ correct state & sheet
                         LocationChangerView(currentLocation: store.profile.location) { newLoc in
                             store.setLocation(newLoc)
-                            showLocationChanger = false
                         }
                     }
+
+
                 }
 
                 // Search + filter row
@@ -668,7 +961,16 @@ struct CatalogView: View {
                 .navigationDestination(for: BoardGame.self) { game in
                     GameDetailView(game: game)
                 }
-                .navigationTitle("Board Games")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .principal) {
+                        Text("Welcome \(store.profile.firstName) \(store.profile.lastName)")
+                            .font(.headline)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.6)
+                            .multilineTextAlignment(.center)
+                    }
+                }
             }
         }
     }
@@ -708,6 +1010,50 @@ struct LocationChangerView: View {
     }
 }
 
+
+struct BundlePickerView: View {
+    @Environment(\.dismiss) private var dismiss
+    @EnvironmentObject var store: AppStore
+
+    let baseGame: BoardGame
+    let onDone: ([BoardGame]) -> Void
+
+    @State private var selected: Set<UUID> = []
+
+    var otherGames: [BoardGame] {
+        store.catalog.filter { $0.id != baseGame.id }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List(otherGames, id: \.id, selection: $selected) { game in
+                HStack {
+                    Text(game.title)
+                    Spacer()
+                    Text(game.genre.rawValue).foregroundStyle(.secondary)
+                }
+            }
+            .environment(\.editMode, .constant(.active)) // enable multi-select UI
+            .navigationTitle("Pick 2 games")
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") {
+                        guard selected.count == 2 else { return }
+                        let picks = otherGames.filter { selected.contains($0.id) }
+                        onDone(picks)
+                        dismiss()
+                    }
+                }
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
+
+
 struct GameRow: View {
     let game: BoardGame
     var body: some View {
@@ -742,14 +1088,43 @@ struct GameRow: View {
     }
 }
 
+
 struct GameDetailView: View {
     @EnvironmentObject var store: AppStore
+
+    // MARK: State
     @State private var showRentSheet = false
+    @State private var showBundlePicker = false
+    @State private var plan: PurchasePlan = .oneTime
+    @State private var pickup = Calendar.current.date(byAdding: .hour, value: 2, to: Date()) ?? Date()
+    @State private var days: Int = 2
+    @State private var bundleExtras: [BoardGame] = []
+
+    // MARK: Constants
+    private let monthlyPrice: Double = 29.99
+    private let pickupAddress = "6386 Vineland Road, Orlando, Florida"
+
+    // MARK: Input
     let game: BoardGame
-    
+
+    // MARK: Computeds
+    private var oneTimeSubtotal: Double { game.dailyPrice * Double(days) }
+    private var oneTimeTotal: Double { oneTimeSubtotal + game.deposit }
+
+    private var combinedBundleGames: [BoardGame] { [game] + bundleExtras }
+    private var bundleSubtotalDaily: Double { combinedBundleGames.map(\.dailyPrice).reduce(0, +) * Double(days) }
+    private var bundleDepositTotal: Double { combinedBundleGames.map(\.deposit).reduce(0, +) }
+    private var bundleDiscountDaily: Double { bundleSubtotalDaily * 0.15 }
+    private var bundleDiscountDeposit: Double { bundleDepositTotal * 0.10 }
+    private var bundleTotal: Double {
+        (bundleSubtotalDaily - bundleDiscountDaily) + (bundleDepositTotal - bundleDiscountDeposit)
+    }
+
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
+
+                // Image
                 Image(game.imageName)
                     .resizable()
                     .scaledToFit()
@@ -757,65 +1132,179 @@ struct GameDetailView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 20))
                     .padding(.horizontal)
 
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(game.title)
-                        .font(.largeTitle.bold())
-                    HStack(spacing: 8) {
-                        Text(game.genre.rawValue)
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(.thinMaterial)
-                            .clipShape(Capsule())
-                        Text(game.difficulty.rawValue)
-                            .padding(.horizontal, 10).padding(.vertical, 6)
-                            .background(.thinMaterial)
-                            .clipShape(Capsule())
-                    }
-                    Text("\(game.playersText) · \(game.ageText)")
-                        .foregroundStyle(.secondary)
-                    
-                    HStack {
-                        VStack(alignment: .leading) {
-                            Text("Price per day")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(game.dailyPrice.asCurrency())
-                                .font(.title3).bold()
-                        }
-                        Spacer()
-                        VStack(alignment: .leading) {
-                            Text("Refundable deposit")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                            Text(game.deposit.asCurrency())
-                                .font(.title3).bold()
-                        }
-                    }
-                    
+                // Title + Description
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(game.title).font(.largeTitle.bold())
                     Text(game.description)
-                        .padding(.top, 4)
+                        .font(.body)
+                        .foregroundColor(.primary)
                 }
                 .padding(.horizontal)
-            }
-        }
-        .toolbar {
-            ToolbarItem(placement: .bottomBar) {
-                Button(action: { showRentSheet = true }) {
-                    Label("Rent this game", systemImage: "creditcard")
-                        .font(.headline)
-                        .frame(maxWidth: .infinity)
+
+                // Fixed pickup location
+                HStack(spacing: 8) {
+                    Image(systemName: "mappin.and.ellipse")
+                    Text(pickupAddress)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
+                    Spacer()
+                    if let url = URL(string: "http://maps.apple.com/?address=6386+Vineland+Road,Orlando,Florida") {
+                        Link(destination: url) { Image(systemName: "arrow.up.right.square") }
+                            .buttonStyle(.plain)
+                    }
                 }
-                .buttonStyle(.borderedProminent)
+                .padding(.horizontal)
+
+                // Tags
+                HStack(spacing: 8) {
+                    Text(game.genre.rawValue)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(.thinMaterial)
+                        .clipShape(Capsule())
+                    Text(game.difficulty.rawValue)
+                        .padding(.horizontal, 10).padding(.vertical, 6)
+                        .background(.thinMaterial)
+                        .clipShape(Capsule())
+                }
+                .padding(.horizontal)
+
+                // Plan picker (One‑time → Bundle → Monthly)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Choose your plan").font(.headline)
+                    Picker("Plan", selection: $plan) {
+                        ForEach(PurchasePlan.allCases) { p in
+                            Text(p.rawValue).tag(p)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                }
+                .padding(.horizontal)
+
+                // Plan-specific UI
+                Group {
+                    switch plan {
+                    case .oneTime, .bundle:
+                        VStack(alignment: .leading, spacing: 8) {
+                            DatePicker("Pickup", selection: $pickup, in: Date()..., displayedComponents: [.date, .hourAndMinute])
+                            Stepper(value: $days, in: 1...14) { Text("Days: \(days)") }
+                        }
+                        .padding(.horizontal)
+
+                    case .subscription:
+                        VStack(alignment: .leading, spacing: 8) {
+                            Label("Unlimited swaps all month", systemImage: "infinity")
+                            Label("No per‑game deposit", systemImage: "shield.checkerboard")
+                            Label("Cancel anytime (mock)", systemImage: "xmark.circle")
+                            HStack {
+                                Text("Monthly price").foregroundStyle(.secondary)
+                                Spacer()
+                                Text(String(format: "$%.2f", monthlyPrice)).bold()
+                            }
+                        }
+                        .padding(.horizontal)
+                    }
+                }
+
+                // Summary / Actions
+                Group {
+                    switch plan {
+                    case .oneTime:
+                        summaryRow(title: "Price per day", value: game.dailyPrice.asCurrency())
+                        summaryRow(title: "Days", value: "\(days)")
+                        summaryRow(title: "Subtotal", value: oneTimeSubtotal.asCurrency())
+                        summaryRow(title: "Refundable deposit", value: game.deposit.asCurrency())
+                        summaryRow(title: "Total due now", value: oneTimeTotal.asCurrency(), bold: true)
+
+                        Button { showRentSheet = true } label: {
+                            Label("Confirm & Pay (Mock)", systemImage: "checkmark.seal.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .padding(.top, 8)
+
+                    case .subscription:
+                        summaryRow(title: "Monthly Unlimited", value: String(format: "$%.2f", monthlyPrice), bold: true)
+                        Button { store.activateSubscription(monthlyPrice: monthlyPrice) } label: {
+                            Label(store.hasSubscription ? "Subscription Active" : "Start Subscription (Mock)", systemImage: "sparkles")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .disabled(store.hasSubscription)
+                        .padding(.top, 8)
+
+                    case .bundle:
+                        VStack(alignment: .leading, spacing: 6) {
+                            if bundleExtras.isEmpty {
+                                Text("Pick two more games to complete your bundle.")
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Text("Bundle includes:")
+                                ForEach(combinedBundleGames, id: \.id) { g in
+                                    HStack {
+                                        Text(g.title)
+                                        Spacer()
+                                        Text(g.dailyPrice.asCurrency()).foregroundStyle(.secondary)
+                                    }
+                                }
+                            }
+                            Button { showBundlePicker = true } label: {
+                                Label(bundleExtras.isEmpty ? "Choose 2 games" : "Change games", systemImage: "plus.circle")
+                            }
+                        }
+                        .padding(.horizontal)
+
+                        if bundleExtras.count == 2 {
+                            summaryRow(title: "15% off daily rates", value: "")
+                            summaryRow(title: "10% off refundable deposit", value: "")
+                            summaryRow(title: "Total due now", value: bundleTotal.asCurrency(), bold: true)
+
+                            Button {
+                                store.createBundleRentals(for: combinedBundleGames, pickup: pickup, days: days)
+                            } label: {
+                                Label("Confirm Bundle (Mock)", systemImage: "gift.fill")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .padding(.top, 8)
+                        }
+                    }
+                }
                 .padding(.horizontal)
             }
         }
         .navigationTitle(game.title)
         .navigationBarTitleDisplayMode(.inline)
+
+        // 👇 This .sheet is INSIDE GameDetailView and can see $showRentSheet, game, pickup, days, etc.
         .sheet(isPresented: $showRentSheet) {
-            RentalFlowView(game: game)
-                .presentationDetents([.medium, .large])
+            RentalFlowView(
+                game: game,
+                pickup: pickup,
+                days: days,
+                totalDue: oneTimeTotal
+            )
+            .presentationDetents([.medium, .large])
+        }
+
+        .sheet(isPresented: $showBundlePicker) {
+            BundlePickerView(baseGame: game) { picks in
+                bundleExtras = Array(picks.prefix(2))
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func summaryRow(title: String, value: String, bold: Bool = false) -> some View {
+        HStack {
+            Text(title).foregroundStyle(.secondary)
+            Spacer()
+            Text(value).fontWeight(bold ? .bold : .regular)
         }
     }
 }
+
 
 struct ZstackImage: View {
     let name: String
@@ -833,57 +1322,144 @@ struct ZstackImage: View {
     }
 }
 
+
 struct RentalFlowView: View {
-    @Environment(\.dismiss) private var dismiss
     @EnvironmentObject var store: AppStore
-    
+    @Environment(\.dismiss) private var dismiss
+
     let game: BoardGame
-    @State private var pickup = Calendar.current.date(byAdding: .hour, value: 2, to: Date()) ?? Date()
-    @State private var days: Int = 2
-    @State private var showingPaidAlert = false
-    
-    private var total: Double { game.dailyPrice * Double(days) + game.deposit }
-    
+    let pickup: Date
+    let days: Int
+    let totalDue: Double
+
+    @State private var showSummary = false
+    @State private var recentRental: Rental? = nil
+
+    private var returnDate: Date {
+        Calendar.current.date(byAdding: .day, value: days, to: pickup) ?? pickup
+    }
+
+    private let pickupAddress = "6386 Vineland Road, Orlando, Florida"
+
     var body: some View {
         NavigationStack {
             Form {
-                Section("Schedule") {
-                    DatePicker("Pickup", selection: $pickup, in: Date()..., displayedComponents: [.date, .hourAndMinute])
-                    Stepper(value: $days, in: 1...14) {
-                        Text("Days: \(days)")
+                Section("Game") {
+                    Text(game.title)
+                    Text("Daily rate: \(game.dailyPrice.asCurrency())")
+                    Text("Deposit: \(game.deposit.asCurrency())")
+                }
+
+                Section("Pickup & Return") {
+                    HStack {
+                        Image(systemName: "mappin.and.ellipse").foregroundColor(.red)
+                        Text(pickupAddress)
+                            .font(.subheadline)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.8)
+                        Spacer()
+                        if let url = URL(string: "http://maps.apple.com/?address=6386+Vineland+Road,Orlando,Florida") {
+                            Link(destination: url) { Image(systemName: "arrow.up.right.square") }
+                                .buttonStyle(.plain)
+                        }
                     }
+                    LabeledContent("Pickup", value: pickup.formatted(date: .abbreviated, time: .shortened))
+                    LabeledContent("Return", value: returnDate.formatted(date: .abbreviated, time: .shortened))
                 }
-                
-                Section("Summary") {
-                    HStack { Text("Daily price"); Spacer(); Text(game.dailyPrice.asCurrency()) }
-                    HStack { Text("Days"); Spacer(); Text("\(days)") }
-                    HStack { Text("Subtotal"); Spacer(); Text((game.dailyPrice * Double(days)).asCurrency()) }
-                    HStack { Text("Refundable deposit"); Spacer(); Text(game.deposit.asCurrency()) }
-                    HStack { Text("Total due now").bold(); Spacer(); Text(total.asCurrency()).bold() }
+
+                Section("Total") {
+                    LabeledContent("Total due now", value: totalDue.asCurrency())
                 }
-                
+
                 Section {
                     Button {
-                        store.createRental(for: game, pickup: pickup, days: days)
-                        showingPaidAlert = true
+                        // Create the rental and show summary
+                        let rental = store.createRental(for: game, pickup: pickup, days: days) // ✅ create it
+                        recentRental = rental                                                     // ✅ keep it
+                        showSummary = true
                     } label: {
                         Label("Confirm & Pay (Mock)", systemImage: "checkmark.seal.fill")
                             .frame(maxWidth: .infinity, alignment: .center)
                     }
                     .buttonStyle(.borderedProminent)
-                } footer: {
-                    Text("Payment uses a mock flow for demo purposes. Deposit is refunded automatically when you mark the rental as returned.")
                 }
             }
             .navigationTitle("Confirm Rental")
-            .alert("Payment successful", isPresented: $showingPaidAlert) {
-                Button("Done") { dismiss() }
-            } message: {
-                Text("Your rental has been created. We'll remind you on pickup and return days.")
+            .navigationBarTitleDisplayMode(.inline)
+            .fullScreenCover(isPresented: $showSummary, onDismiss: {
+                dismiss()
+            }) {
+                if let rental = recentRental {
+                    RentalSummaryView(
+                        rental: rental,
+                        pickupAddress: "6386 Vineland Road, Orlando, Florida"
+                    )
+                }
             }
         }
     }
 }
+
+struct RentalSummaryView: View {
+    @EnvironmentObject var store: AppStore
+    @Environment(\.dismiss) private var dismiss
+
+    let rental: Rental
+    let pickupAddress: String
+
+    var body: some View {
+        NavigationStack {
+            VStack(spacing: 20) {
+                Spacer().frame(height: 12)
+
+                Image(systemName: "checkmark.seal.fill")
+                    .font(.system(size: 64, weight: .bold))
+                Text("You’re all set!")
+                    .font(.largeTitle.bold())
+
+                VStack(alignment: .leading, spacing: 12) {
+                    LabeledContent("Confirmation", value: rental.confirmationCode ?? "—")
+                    LabeledContent("Game", value: rental.game.title)
+
+                    HStack(alignment: .firstTextBaseline) {
+                        Text("Pickup Location")
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                        Text(pickupAddress)
+                            .font(.subheadline)
+                            .multilineTextAlignment(.trailing)
+                            .lineLimit(2)
+                            .minimumScaleFactor(0.8)
+                    }
+
+                    LabeledContent("Pickup", value: rental.pickup.formatted(date: .abbreviated, time: .shortened))
+                    LabeledContent("Return", value: rental.returnDate.formatted(date: .abbreviated, time: .shortened))
+                    LabeledContent("Total Paid", value: rental.totalPaid.asCurrency())
+                }
+                .frame(maxWidth: .infinity)
+                .padding()
+                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 16))
+
+                Spacer()
+
+                Button {
+                    dismiss()
+                    store.stage = .main
+                } label: {
+                    Text("Done").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .padding(.horizontal)
+                .padding(.bottom)
+            }
+            .padding()
+            .navigationTitle("Rental Summary")
+            .navigationBarTitleDisplayMode(.inline)
+        }
+    }
+}
+
 
 struct ActiveRentalsView: View {
     @EnvironmentObject var store: AppStore
@@ -952,39 +1528,71 @@ struct RentalRow: View {
         .padding(.vertical, 4)
     }
 }
-
 struct RentalDetailView: View {
     @EnvironmentObject var store: AppStore
     let rental: Rental
     @State private var showReturnConfirm = false
-    
+
+    private let pickupAddress = "6386 Vineland Road, Orlando, Florida"
+
     var body: some View {
         Form {
+            // Confirmation
+            Section("Confirmation") {
+                LabeledContent("Number", value: rental.confirmationCode ?? "—")
+            }
+
+            // Game info
             Section("Game") {
                 HStack {
-                    Image(systemName: rental.game.imageName)
-                        .frame(width: 28)
+                    Image(rental.game.imageName)
+                        .resizable()
+                        .scaledToFit()
+                        .frame(width: 32, height: 32)
+                        .clipShape(RoundedRectangle(cornerRadius: 6))
                     Text(rental.game.title)
                     Spacer()
                     RatingView(rating: rental.game.rating)
                 }
                 Text(rental.game.description)
                     .font(.callout)
+                    .foregroundColor(.primary)
             }
-            
+
+            // Pickup Location
+            Section("Pickup Location") {
+                HStack {
+                    Image(systemName: "mappin.and.ellipse").foregroundColor(.red)
+                    Text(pickupAddress)
+                        .font(.subheadline)
+                        .lineLimit(2)
+                        .minimumScaleFactor(0.8)
+                    Spacer()
+                    if let url = URL(string: "http://maps.apple.com/?address=6386+Vineland+Road,Orlando,Florida") {
+                        Link(destination: url) {
+                            Image(systemName: "arrow.up.right.square").imageScale(.medium)
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("Open in Maps")
+                    }
+                }
+            }
+
+            // Schedule
             Section("Schedule") {
                 LabeledContent("Pickup", value: rental.pickup.formatted(date: .abbreviated, time: .shortened))
                 LabeledContent("Return", value: rental.returnDate.formatted(date: .abbreviated, time: .omitted))
                 LabeledContent("Days", value: "\(rental.days)")
             }
-            
+
+            // Payment
             Section("Payment") {
                 LabeledContent("Daily price", value: rental.dailyPrice.asCurrency())
                 LabeledContent("Deposit", value: rental.deposit.asCurrency())
                 LabeledContent("Total paid", value: rental.totalPaid.asCurrency())
                 LabeledContent("Status", value: rental.paymentStatus.rawValue.capitalized)
             }
-            
+
             if rental.status != .returned {
                 Section {
                     Button(role: .destructive) { showReturnConfirm = true } label: {
@@ -1003,75 +1611,96 @@ struct RentalDetailView: View {
     }
 }
 
+                        
 struct ProfileView: View {
-    @EnvironmentObject var store: AppStore
-    @State private var name: String = ""
-    @State private var email: String = ""
-    @State private var phone: String = ""
-    @State private var location: String = ""
-    
-    var body: some View {
-        Form {
-            Section("Profile") {
-                TextField("Name", text: Binding(
-                    get: { name.isEmpty ? store.profile.name : name },
-                    set: { name = $0; store.profile.name = $0 }
-                ))
-                TextField("Email", text: Binding(
-                    get: { email.isEmpty ? store.profile.email : email },
-                    set: { email = $0; store.profile.email = $0 }
-                ))
-                .keyboardType(.emailAddress)
-                .textInputAutocapitalization(.never)
-                TextField("Phone", text: Binding(
-                    get: { phone.isEmpty ? store.profile.phone : phone },
-                    set: { phone = $0; store.profile.phone = $0 }
-                ))
-                .keyboardType(.phonePad)
-                TextField("Location (City, State, Country)", text: Binding(
-                    get: { location.isEmpty ? store.profile.location : location },
-                    set: { location = $0; store.profile.location = $0 }
-                ))
-            }
-            Section("About") {
-                LabeledContent("App Version", value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0")
-                Text("This is a demo app for a board‑game rental flow. Payments are mocked; deposits are refunded when you mark a rental as returned.")
-            }
-            Section {
-                Button(role: .destructive) {
-                    store.stage = .auth
-                    store.profile = UserProfile() // clear profile
-                    Persistence.shared.saveStage(.auth)
-                    Persistence.shared.saveProfile(store.profile)
-                } label: {
-                    Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
-                        .frame(maxWidth: .infinity, alignment: .center)
-                }
-            }
-
-        }
-        .onDisappear { Persistence.shared.saveProfile(store.profile) }
-        .navigationTitle("Profile")
-    }
-}
-
-// MARK: - App Entry
-
+                            @EnvironmentObject var store: AppStore
+                            @State private var name: String = ""
+                            @State private var email: String = ""
+                            @State private var phone: String = ""
+                            @State private var location: String = ""
+                            
+                            var body: some View {
+                                Form {
+                                    Section("Profile") {
+                                        TextField("First name", text: Binding(
+                                            get: { store.profile.firstName },
+                                            set: { store.profile.firstName = $0 }
+                                        ))
+                                        .textContentType(.givenName)
+                                        
+                                        TextField("Last name", text: Binding(
+                                            get: { store.profile.lastName },
+                                            set: { store.profile.lastName = $0 }
+                                        ))
+                                        .textContentType(.familyName)
+                                        
+                                        TextField("Email", text: Binding(
+                                            get: { store.profile.email },
+                                            set: { store.profile.email = $0 }
+                                        ))
+                                        .keyboardType(.emailAddress)
+                                        .textInputAutocapitalization(.never)
+                                        .textContentType(.emailAddress)
+                                        
+                                        TextField("Phone", text: Binding(
+                                            get: { store.profile.phone },
+                                            set: { store.profile.phone = $0 }
+                                        ))
+                                        .keyboardType(.phonePad)
+                                        .textContentType(.telephoneNumber)
+                                        
+                                        TextField("Location (City, State, Country)", text: Binding(
+                                            get: { store.profile.location },
+                                            set: { store.profile.location = $0 }
+                                        ))
+                                    }
+                                    
+                                    Section("About") {
+                                        LabeledContent(
+                                            "App Version",
+                                            value: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+                                        )
+                                        Text("This is a demo app for a board‑game rental flow. Payments are mocked; deposits are refunded when you mark a rental as returned.")
+                                    }
+                                    
+                                    Section {
+                                        Button(role: .destructive) {
+                                            store.stage = .auth
+                                            store.profile = UserProfile() // clear profile
+                                            Persistence.shared.saveStage(.auth)
+                                            Persistence.shared.saveProfile(store.profile)
+                                        } label: {
+                                            Label("Sign Out", systemImage: "rectangle.portrait.and.arrow.right")
+                                                .frame(maxWidth: .infinity, alignment: .center)
+                                        }
+                                    }
+                                }
+                                .onDisappear { Persistence.shared.saveProfile(store.profile) }
+                                .navigationTitle("Profile") // Tip: keep Profile here; put the “Welcome First Last” title in CatalogView
+                            }
+                        }
+                        
+                        // MARK: - App Entry
+                        
 @main
 struct BoardRentalApp: App {
-    @StateObject private var store = AppStore()
-    var body: some Scene {
-        WindowGroup {
-            Group {
-                switch store.stage {
-                case .auth: AuthView()
-                case .location: LocationCaptureView()
-                case .main: RootView()
-                }
-            }
-            .environmentObject(store)
-            .tint(.black)
-        }
-    }
-}
-
+                            @StateObject private var store = AppStore()
+                            var body: some Scene {
+                                WindowGroup {
+                                    Group {
+                                        switch store.stage {
+                                        case .auth: AuthView()
+                                        case .profile: ProfileCaptureView()        // 👈 add this
+                                        case .location: LocationCaptureView()
+                                        case .celebration: CelebrationView()     // 👈 add this
+                                        case .main: RootView()
+                                        case .unavailable: ServiceUnavailableView(location: store.profile.location)
+                                        }
+                                        
+                                    }
+                                    .environmentObject(store)
+                                    .tint(.black)
+                                }
+                            }
+                        }
+            
