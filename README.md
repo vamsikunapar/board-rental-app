@@ -30,7 +30,6 @@ It includes onboarding, location capture, rental flows, and a confetti celebrati
 ### 4. Enjoy!
 - The app will build and launch in the iOS Simulator  
 - Sign up, complete your profile, choose **Orlando** as your location  
-- 🎉 You’ll see the welcome confetti before entering the catalog  
 
 ---
 
