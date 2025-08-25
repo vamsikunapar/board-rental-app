@@ -7,6 +7,13 @@ It includes onboarding, location capture, rental flows, and a confetti celebrati
 
 ## 📥 How to Download and Run
 
+1. **Clone the repository**
+   ```bash
+   git clone https://github.com/your-username/BoardBurrow.git
+   cd BoardBurrow
+
+
+
 ### 1. Install Xcode
 - Open the **App Store** on your Mac  
 - Search for **Xcode**  
