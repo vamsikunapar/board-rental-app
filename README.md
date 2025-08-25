@@ -10,5 +10,5 @@ It includes onboarding, location capture, rental flows, and a confetti celebrati
 
 1. **Clone the repository**
    ```bash
-   git clone https://github.com/your-username/BoardBurrow.git
+   git clone https://github.com/vamsikunapar/BoardBurrow.git
    cd BoardBurrow
